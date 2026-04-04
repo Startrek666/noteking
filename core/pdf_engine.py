@@ -475,19 +475,38 @@ class LaTeXNoteBuilder:
 
     def _md_to_tex(self, md: str, frames: list[ScoredFrame]) -> str:
         """Convert simplified markdown with {IMAGE:N} to LaTeX body."""
+        # Fix 1: Expand inline {TAG}content{/TAG} on same line into multi-line form
+        # so the line-by-line parser below can handle them correctly.
+        BOX_TAGS = {
+            "IMPORTANT": ("importantbox", "Key Point"),
+            "KNOWLEDGE": ("knowledgebox", "Background"),
+            "WARNING": ("warningbox", "Caution"),
+        }
+        for tag in BOX_TAGS:
+            md = re.sub(
+                rf"\{{{tag}\}}(.*?)\{{/{tag}\}}",
+                rf"{{{tag}}}\n\1\n{{/{tag}}}",
+                md, flags=re.DOTALL,
+            )
+
         lines = md.split("\n")
         tex_lines = []
         in_code = False
+        in_table = False  # Fix 2: track table state to wrap with tabular env
+        is_header = False
         code_lang = ""
+        open_boxes: list[str] = []  # Fix 1: track unclosed boxes
 
         for line in lines:
+            stripped = line.strip()
+
             # Code blocks
-            if line.strip().startswith("```"):
+            if stripped.startswith("```"):
                 if in_code:
                     tex_lines.append("\\end{lstlisting}")
                     in_code = False
                 else:
-                    code_lang = line.strip().replace("```", "").strip() or "python"
+                    code_lang = stripped.replace("```", "").strip() or "python"
                     tex_lines.append(f"\\begin{{lstlisting}}[language={code_lang}]")
                     in_code = True
                 continue
@@ -497,7 +516,7 @@ class LaTeXNoteBuilder:
                 continue
 
             # Image markers
-            img_match = re.match(r"\s*\{IMAGE:(\d+)\}", line)
+            img_match = re.match(r"\s*\{IMAGE:(\d+)\}", stripped)
             if img_match:
                 n = int(img_match.group(1))
                 if 1 <= n <= len(frames):
@@ -517,27 +536,61 @@ class LaTeXNoteBuilder:
                     )
                 continue
 
-            # Highlight boxes
-            if line.strip().startswith("{IMPORTANT}"):
-                tex_lines.append("\\begin{importantbox}{Key Point}")
+            # Fix 1: Highlight box open/close tags (now handles multi-line form)
+            box_handled = False
+            for tag, (env, label) in BOX_TAGS.items():
+                if stripped == f"{{{tag}}}":
+                    tex_lines.append(f"\\begin{{{env}}}{{{label}}}")
+                    open_boxes.append(env)
+                    box_handled = True
+                    break
+                if stripped == f"{{/{tag}}}":
+                    tex_lines.append(f"\\end{{{env}}}")
+                    if open_boxes and open_boxes[-1] == env:
+                        open_boxes.pop()
+                    box_handled = True
+                    break
+            if box_handled:
                 continue
-            if line.strip().startswith("{/IMPORTANT}"):
-                tex_lines.append("\\end{importantbox}")
+
+            # Fix 2: Tables — detect rows and wrap in tabular environment
+            if "|" in stripped and stripped.startswith("|"):
+                cells = [c.strip() for c in stripped.split("|")[1:-1]]
+                if all(set(c) <= set("-: ") for c in cells):
+                    continue  # skip separator row
+                if not in_table:
+                    col_spec = "|" + "l|" * len(cells)
+                    tex_lines.append("\\begin{center}")
+                    tex_lines.append(f"\\begin{{tabular}}{{{col_spec}}}")
+                    tex_lines.append("\\hline")
+                    in_table = True
+                    is_header = True
+                row = " & ".join(_tex_escape(c) for c in cells)
+                tex_lines.append(f"{row} \\\\")
+                tex_lines.append("\\hline")
+                is_header = False
                 continue
-            if line.strip().startswith("{KNOWLEDGE}"):
-                tex_lines.append("\\begin{knowledgebox}{Background}")
+            elif in_table:
+                tex_lines.append("\\end{tabular}")
+                tex_lines.append("\\end{center}")
+                in_table = False
+
+            # Horizontal rules
+            if stripped in ("---", "***", "___"):
+                tex_lines.append("\\bigskip\\hrule\\bigskip")
                 continue
-            if line.strip().startswith("{/KNOWLEDGE}"):
-                tex_lines.append("\\end{knowledgebox}")
-                continue
-            if line.strip().startswith("{WARNING}"):
-                tex_lines.append("\\begin{warningbox}{Caution}")
-                continue
-            if line.strip().startswith("{/WARNING}"):
-                tex_lines.append("\\end{warningbox}")
+
+            # Blockquotes
+            if stripped.startswith("> "):
+                tex_lines.append(
+                    f"\\begin{{quote}}\\textit{{{_tex_escape(stripped[2:])}}}\\end{{quote}}"
+                )
                 continue
 
             # Headings
+            if stripped.startswith("# ") and not stripped.startswith("## "):
+                tex_lines.append(f"\\section*{{{_tex_escape(stripped[2:].strip())}}}")
+                continue
             if line.startswith("## "):
                 tex_lines.append(f"\\section{{{_tex_escape(line[3:].strip())}}}")
                 continue
@@ -557,6 +610,15 @@ class LaTeXNoteBuilder:
             processed = re.sub(r"\$(.+?)\$", r"$\1$", processed)
 
             tex_lines.append(processed)
+
+        # Fix 2: close any unclosed table
+        if in_table:
+            tex_lines.append("\\end{tabular}")
+            tex_lines.append("\\end{center}")
+
+        # Fix 1: close any unclosed boxes
+        for env in reversed(open_boxes):
+            tex_lines.append(f"\\end{{{env}}}")
 
         return "\n".join(tex_lines)
 
