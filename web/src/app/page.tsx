@@ -146,58 +146,72 @@ export default function Home() {
       let buffer = "";
       let accumulated = "";
 
+      const processLine = (line: string) => {
+        if (!line.startsWith("data: ")) return;
+        const jsonStr = line.slice(6).trim();
+        if (!jsonStr) return;
+
+        try {
+          const event = JSON.parse(jsonStr);
+          switch (event.stage) {
+            case "info":
+              setStreamStage(event.message || "获取视频信息...");
+              if (event.title) setStreamTitle(event.title);
+              break;
+            case "subtitle":
+              setStreamStage(event.message || "提取字幕...");
+              break;
+            case "generating":
+              setStreamStage("AI 正在生成笔记...");
+              if (event.content) {
+                accumulated += event.content;
+                setStreamContent(accumulated);
+              }
+              break;
+            case "done": {
+              const finalResult: Result = {
+                title: event.title || streamTitle,
+                content: event.content || accumulated,
+                template: event.template || template,
+                source: event.source || "",
+                platform: event.platform || "",
+                duration: event.duration || 0,
+                frames_b64: event.frames_b64 || {},
+              };
+              setResult(finalResult);
+              addToHistory(finalResult, url.trim());
+              setHistory(loadHistory());
+              break;
+            }
+            case "error":
+              throw new Error(event.message || "生成失败");
+          }
+        } catch (parseErr: any) {
+          if (parseErr.message && !parseErr.message.includes("JSON"))
+            throw parseErr;
+        }
+      };
+
       while (true) {
         const { done, value } = await reader.read();
-        if (done) break;
 
-        buffer += decoder.decode(value, { stream: true });
+        if (value) {
+          buffer += decoder.decode(value, { stream: !done });
+        }
+
+        // 每次都处理 buffer（包括 done=true 时剩余的最后数据）
         const lines = buffer.split("\n");
-        buffer = lines.pop() || "";
+        // 如果流没结束，最后一行可能不完整，保留到下次
+        buffer = done ? "" : (lines.pop() || "");
 
         for (const line of lines) {
-          if (!line.startsWith("data: ")) continue;
-          const jsonStr = line.slice(6).trim();
-          if (!jsonStr) continue;
+          processLine(line);
+        }
 
-          try {
-            const event = JSON.parse(jsonStr);
-            switch (event.stage) {
-              case "info":
-                setStreamStage(event.message || "获取视频信息...");
-                if (event.title) setStreamTitle(event.title);
-                break;
-              case "subtitle":
-                setStreamStage(event.message || "提取字幕...");
-                break;
-              case "generating":
-                setStreamStage("AI 正在生成笔记...");
-                if (event.content) {
-                  accumulated += event.content;
-                  setStreamContent(accumulated);
-                }
-                break;
-              case "done": {
-                const finalResult: Result = {
-                  title: event.title || streamTitle,
-                  content: event.content || accumulated,
-                  template: event.template || template,
-                  source: event.source || "",
-                  platform: event.platform || "",
-                  duration: event.duration || 0,
-                  frames_b64: event.frames_b64 || {},
-                };
-                setResult(finalResult);
-                addToHistory(finalResult, url.trim());
-                setHistory(loadHistory());
-                break;
-              }
-              case "error":
-                throw new Error(event.message || "生成失败");
-            }
-          } catch (parseErr: any) {
-            if (parseErr.message && !parseErr.message.includes("JSON"))
-              throw parseErr;
-          }
+        if (done) {
+          // 处理 buffer 里剩余的最后一行
+          if (buffer.trim()) processLine(buffer.trim());
+          break;
         }
       }
     } catch (e: any) {
