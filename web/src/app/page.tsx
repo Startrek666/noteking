@@ -34,7 +34,6 @@ type Result = {
   source: string;
   platform: string;
   duration: number;
-  frames_b64?: Record<string, string>;
 };
 
 type HistoryItem = {
@@ -176,7 +175,6 @@ export default function Home() {
                 source: event.source || "",
                 platform: event.platform || "",
                 duration: event.duration || 0,
-                frames_b64: event.frames_b64 || {},
               };
               setResult(finalResult);
               addToHistory(finalResult, url.trim());
@@ -270,7 +268,6 @@ export default function Home() {
           body: JSON.stringify({
             tex_content: content,
             filename: title,
-            frames_b64: result?.frames_b64 || {},
           }),
         });
         if (!resp.ok) {
