@@ -130,11 +130,118 @@ async def summarize_video_stream(req: VideoRequest):
                              message=f"字幕来源: {subs.source}",
                              source=subs.source)
 
+            # ── 关键帧提取（仅 latex_pdf 模板）──────────────────────────────
+            frames_b64: dict[str, str] = {}   # {"frame_00.jpg": "<base64>", ...}
+            frames_info: list[dict] = []       # [{"name": "...", "ts": 12.5}, ...]
+            if req.template == "latex_pdf":
+                try:
+                    import base64
+                    import subprocess as _sp
+                    import os as _os
+
+                    frames_dir = work_dir / "frames"
+                    frames_dir.mkdir(exist_ok=True)
+
+                    duration = meta.duration or 0
+                    # 按视频时长决定提取帧数（最多 10 帧）
+                    num_frames = min(10, max(3, int(duration / 30)))
+                    # 均匀分布时间点，避开片头片尾 10%
+                    margin = max(5.0, duration * 0.1)
+                    effective = max(duration - 2 * margin, 10.0)
+                    # 每个片段：只下载时间点前后 8 秒
+                    seg_len = 8
+
+                    proxy = (
+                        cfg.proxy.for_ytdlp
+                        or _os.environ.get("NOTEKING_PROXY")
+                        or _os.environ.get("HTTP_PROXY", "")
+                    )
+                    cookies_arg = (
+                        ["--cookies", "/app/bilibili_cookies.txt"]
+                        if Path("/app/bilibili_cookies.txt").exists() else []
+                    )
+
+                    yield _sse_event("info",
+                                     message=f"正在提取 {num_frames} 张截图（分段下载，每段约30秒）...")
+
+                    for i in range(num_frames):
+                        # 均匀分布时间戳
+                        frac = i / max(num_frames - 1, 1)
+                        ts = margin + frac * effective
+                        ts_start = max(0, ts - seg_len // 2)
+                        ts_end = ts_start + seg_len
+                        ts_str = f"{int(ts)//60:02d}:{int(ts)%60:02d}"
+
+                        seg_path = frames_dir / f"seg_{i:02d}.mp4"
+                        frame_path = frames_dir / f"frame_{i:02d}.jpg"
+
+                        # 下载片段
+                        dl_cmd = ["yt-dlp"] + (
+                            ["--proxy", proxy] if proxy else []
+                        ) + cookies_arg + [
+                            "-f", "worstvideo+worstaudio/worst",
+                            "--download-sections", f"*{ts_start:.0f}-{ts_end:.0f}",
+                            "--force-keyframes-at-cuts",
+                            "-o", str(seg_path),
+                            "--no-playlist",
+                            "--quiet",
+                            req.url,
+                        ]
+                        try:
+                            _sp.run(dl_cmd, capture_output=True, timeout=60)
+                        except _sp.TimeoutExpired:
+                            yield _sse_event("info", message=f"片段 {i+1} 下载超时，跳过")
+                            continue
+
+                        if not seg_path.exists():
+                            continue
+
+                        # 用 ffmpeg 从片段中间提取 1 帧
+                        mid = seg_len // 2
+                        ffmpeg_cmd = [
+                            "ffmpeg", "-y",
+                            "-ss", str(mid),
+                            "-i", str(seg_path),
+                            "-vframes", "1",
+                            "-q:v", "3",
+                            "-vf", "scale=960:-2",
+                            str(frame_path),
+                        ]
+                        try:
+                            _sp.run(ffmpeg_cmd, capture_output=True, timeout=15)
+                        except Exception:
+                            pass
+
+                        if frame_path.exists():
+                            frames_b64[f"frame_{i:02d}.jpg"] = base64.b64encode(
+                                frame_path.read_bytes()
+                            ).decode()
+                            frames_info.append({
+                                "name": f"frame_{i:02d}.jpg",
+                                "ts": ts,
+                                "ts_str": ts_str,
+                            })
+                            yield _sse_event("info",
+                                             message=f"截图 {len(frames_info)}/{num_frames} 完成（{ts_str}）")
+
+                        # 删除片段节省空间
+                        try:
+                            seg_path.unlink()
+                        except Exception:
+                            pass
+
+                    yield _sse_event("info",
+                                     message=f"共提取 {len(frames_info)} 张截图")
+                except Exception as fe:
+                    yield _sse_event("info", message=f"截图提取跳过: {fe}")
+            # ────────────────────────────────────────────────────────────────
+
             yield _sse_event("generating", message="AI 正在生成笔记...")
             tmpl = get_template(req.template, user_prompt=req.custom_prompt)
             ctx = TemplateContext(
                 meta=meta, subtitles=subs, config=cfg,
-                extra={"custom_prompt": req.custom_prompt},
+                extra={"custom_prompt": req.custom_prompt,
+                       "frames_info": frames_info},
             )
             prompt = tmpl.build_prompt(ctx)
             system = tmpl.system_prompt(ctx)
@@ -162,6 +269,7 @@ async def summarize_video_stream(req: VideoRequest):
                 "url": req.url,
                 "platform": parsed.platform.value,
                 "duration": meta.duration,
+                "frames_b64": frames_b64,   # 传给前端，下载 PDF 时回传给编译服务
             }
             cache.set(req.url, req.template, result)
 
@@ -256,10 +364,7 @@ async def compile_latex(req: LatexCompileRequest):
         async with httpx.AsyncClient(timeout=180, transport=transport) as client:
             resp = await client.post(
                 f"{LATEX_COMPILER_URL}/compile",
-                json={
-                    "tex_content": req.tex_content,
-                    "filename": req.filename,
-                },
+                json={"tex_content": req.tex_content, "filename": req.filename},
             )
     except httpx.ConnectError:
         raise HTTPException(status_code=503, detail="LaTeX 编译服务未启动，请联系管理员")
