@@ -5,6 +5,13 @@ from __future__ import annotations
 import time
 from collections import defaultdict
 from datetime import date
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+# load .env files in the project root directory
+_env_path = Path(__file__).resolve().parent.parent / ".env"
+load_dotenv(_env_path, override=False)
 
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
